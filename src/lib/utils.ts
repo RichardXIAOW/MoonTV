@@ -37,7 +37,9 @@ export function processImageUrl(originalUrl: string): string {
   const proxyUrl = getImageProxyUrl();
   if (!proxyUrl) return originalUrl;
 
-  return `${proxyUrl}${encodeURIComponent(originalUrl)}`;
+  // 确保代理 URL 格式正确：/api/image-proxy?url=xxx
+  const separator = proxyUrl.includes('?') ? '&' : '?';
+  return `${proxyUrl}${separator}url=${encodeURIComponent(originalUrl)}`;
 }
 
 /**
