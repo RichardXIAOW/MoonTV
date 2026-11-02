@@ -9,6 +9,18 @@ import { useRouter, useSearchParams } from 'next/navigation';
 import { Suspense, useEffect, useRef, useState } from 'react';
 
 import {
+  detectCastCapabilities,
+  isHlsUrl,
+  needsNativeHlsForCast,
+} from '@/lib/cast/capabilities';
+import {
+  prepareVideoForCasting,
+  promptRemotePlayback,
+  showAirPlayPicker,
+  stopCasting,
+  watchCastTarget,
+} from '@/lib/cast/playback-target';
+import {
   deleteFavorite,
   deletePlayRecord,
   deleteSkipConfig,
@@ -24,6 +36,7 @@ import {
 import { SearchResult } from '@/lib/types';
 import { getVideoResolutionFromM3u8, processImageUrl } from '@/lib/utils';
 
+import CastPanel from '@/components/CastPanel';
 import EpisodeSelector from '@/components/EpisodeSelector';
 import PageLayout from '@/components/PageLayout';
 
@@ -193,6 +206,29 @@ function PlayPageClient() {
 
   const artPlayerRef = useRef<any>(null);
   const artRef = useRef<HTMLDivElement | null>(null);
+
+  // -----------------------------------------------------------------------------
+  // 投屏（AirPlay / Remote Playback）状态
+  // -----------------------------------------------------------------------------
+  // 投屏面板开关
+  const [castPanelOpen, setCastPanelOpen] = useState(false);
+  // 是否已连接到远端播放设备
+  const [castConnected, setCastConnected] = useState(false);
+  // 投屏动作进行中（设备选择器等）
+  const [castBusy, setCastBusy] = useState(false);
+  // 面板提示文案
+  const [castMessage, setCastMessage] = useState<string | null>(null);
+  // 是否已切换为「原生解码」播放（投屏兼容模式，此模式下去广告失效）
+  const [castMode, setCastMode] = useState(false);
+
+  const castModeRef = useRef(false);
+  const castConnectedRef = useRef(false);
+  // 待执行的投屏动作：切换原生解码后需要等 canplay 再唤起设备选择器
+  const pendingCastRef = useRef<'airplay' | 'remote' | null>(null);
+  // 上一次的 castMode，用于判断是否需要强制重建播放器
+  const lastCastModeRef = useRef(false);
+  // 取消投屏状态监听
+  const stopWatchCastRef = useRef<(() => void) | null>(null);
 
   // -----------------------------------------------------------------------------
   // 工具函数（Utils）
@@ -428,12 +464,8 @@ function PlayPageClient() {
       video.appendChild(sourceEl);
     }
 
-    // 始终允许远程播放（AirPlay / Cast）
-    video.disableRemotePlayback = false;
-    // 如果曾经有禁用属性，移除之
-    if (video.hasAttribute('disableRemotePlayback')) {
-      video.removeAttribute('disableRemotePlayback');
-    }
+    // 允许远程播放（AirPlay / Remote Playback），并清理可能存在的禁用属性
+    prepareVideoForCasting(video);
   };
 
   // 去广告相关函数
@@ -1160,6 +1192,180 @@ function PlayPageClient() {
     }
   };
 
+  // ---------------------------------------------------------------------------
+  // 投屏（AirPlay / Remote Playback）
+  // ---------------------------------------------------------------------------
+  const getCastVideo = (): HTMLVideoElement | null =>
+    (artPlayerRef.current?.video as HTMLVideoElement) || null;
+
+  // 打开投屏面板（面板位于播放器容器上层，全屏状态下先退出全屏以保证可见）
+  const openCastPanel = () => {
+    const player = artPlayerRef.current;
+    if (player) {
+      try {
+        if (player.fullscreen) player.fullscreen = false;
+        if (player.fullscreenWeb) player.fullscreenWeb = false;
+      } catch {
+        /* ignore */
+      }
+    }
+    if (typeof document !== 'undefined' && document.fullscreenElement) {
+      document.exitFullscreen().catch(() => undefined);
+    }
+    setCastMessage(null);
+    setCastPanelOpen(true);
+  };
+
+  // 切换到原生解码模式（hls.js → 浏览器原生 HLS），使视频源可被投屏设备接管
+  const enableCastMode = () => {
+    const player = artPlayerRef.current;
+    if (player) {
+      const t = player.currentTime || 0;
+      if (t > 0) resumeTimeRef.current = t;
+    }
+    castModeRef.current = true;
+    setCastMode(true);
+  };
+
+  // 退出原生解码模式，恢复 hls.js（去广告功能随之恢复）
+  const disableCastMode = () => {
+    const player = artPlayerRef.current;
+    if (player) {
+      const t = player.currentTime || 0;
+      if (t > 0) resumeTimeRef.current = t;
+    }
+    pendingCastRef.current = null;
+    castModeRef.current = false;
+    setCastMode(false);
+    setCastMessage('已退出原生解码模式，去广告恢复生效');
+  };
+
+  // AirPlay 投屏
+  const handleAirPlay = () => {
+    const caps = detectCastCapabilities();
+
+    if (!caps.airplay) {
+      setCastMessage(
+        '当前浏览器不支持 AirPlay，请在 iPhone / iPad / Mac 的 Safari 中使用。'
+      );
+      return;
+    }
+
+    const video = getCastVideo();
+    if (!video) {
+      setCastMessage('播放器尚未就绪，请稍后重试。');
+      return;
+    }
+
+    // HLS + hls.js（MSE）无法投屏，先切原生解码，canplay 后自动唤起选择器
+    if (needsNativeHlsForCast(videoUrl, caps, castModeRef.current)) {
+      pendingCastRef.current = 'airplay';
+      setCastMessage(
+        '正在切换原生解码以支持投屏…（Safari 的设备选择器需要用户手势，若未自动弹出，请再点一次「AirPlay 投屏」）'
+      );
+      enableCastMode();
+      return;
+    }
+
+    const ok = showAirPlayPicker(video);
+    setCastMessage(
+      ok ? '请在 AirPlay 设备列表中选择播放设备' : '未找到可用的 AirPlay 设备'
+    );
+  };
+
+  // 系统投屏 / Chromecast（标准 Remote Playback API）
+  const handleRemoteCast = async () => {
+    const caps = detectCastCapabilities();
+
+    if (!caps.remotePlayback) {
+      setCastMessage('当前浏览器不支持系统投屏，请使用 Chrome / Edge。');
+      return;
+    }
+
+    const video = getCastVideo();
+    if (!video) {
+      setCastMessage('播放器尚未就绪，请稍后重试。');
+      return;
+    }
+
+    // 不带原生 HLS 解码的浏览器无法把 m3u8 交给远端设备
+    if (isHlsUrl(videoUrl) && !caps.nativeHls) {
+      setCastMessage(
+        '当前浏览器不支持直接解码 m3u8，投屏设备无法播放该地址。建议改用 iPhone / iPad 的 Safari 投屏，或复制播放地址到支持 HLS 的播放器。'
+      );
+      return;
+    }
+
+    if (needsNativeHlsForCast(videoUrl, caps, castModeRef.current)) {
+      pendingCastRef.current = 'remote';
+      setCastMessage('正在切换原生解码以支持投屏，稍后自动打开设备列表…');
+      enableCastMode();
+      return;
+    }
+
+    setCastBusy(true);
+    setCastMessage('正在搜索投屏设备…');
+    const result = await promptRemotePlayback(video);
+    setCastBusy(false);
+
+    if (result.ok) {
+      setCastMessage('已连接到投屏设备');
+    } else if (result.reason === 'canceled') {
+      setCastMessage('已取消选择设备');
+    } else if (result.reason === 'not-supported-source') {
+      setCastMessage(
+        '当前播放源不支持直接投屏（MSE 数据流），请改用 AirPlay 或复制地址到其他设备。'
+      );
+    } else {
+      setCastMessage(`投屏失败${result.message ? `：${result.message}` : ''}`);
+    }
+  };
+
+  // 停止投屏
+  const handleStopCast = async () => {
+    setCastBusy(true);
+    await stopCasting(getCastVideo());
+    setCastBusy(false);
+    setCastConnected(false);
+    setCastMessage('已停止投屏');
+  };
+
+  // 复制播放地址（投屏降级方案）
+  const handleCopyCastUrl = async () => {
+    if (!videoUrl) return;
+    try {
+      await navigator.clipboard.writeText(videoUrl);
+    } catch {
+      // 非安全上下文（http）下 clipboard 不可用，用临时 textarea 兜底
+      const textarea = document.createElement('textarea');
+      textarea.value = videoUrl;
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.select();
+      try {
+        document.execCommand('copy');
+      } catch {
+        /* ignore */
+      }
+      textarea.remove();
+    }
+  };
+
+  // 同步投屏相关 ref
+  useEffect(() => {
+    castModeRef.current = castMode;
+  }, [castMode]);
+
+  useEffect(() => {
+    castConnectedRef.current = castConnected;
+  }, [castConnected]);
+
+  useEffect(() => {
+    if (!castConnectedRef.current || !artPlayerRef.current) return;
+    artPlayerRef.current.notice.show = '剧集已切换，投屏画面同步更新';
+  }, [videoUrl]);
+
   useEffect(() => {
     if (
       !Artplayer ||
@@ -1194,8 +1400,16 @@ function PlayPageClient() {
       typeof window !== 'undefined' &&
       typeof (window as any).webkitConvertPointFromNodeToPage === 'function';
 
+    // 投屏能力与播放模式判定
+    const castCaps = detectCastCapabilities();
+    // 原生解码模式：绕过 hls.js，直接把 m3u8 交给浏览器（投屏设备才能接管）
+    const useNativeHls = castMode && isHlsUrl(videoUrl) && castCaps.nativeHls;
+    // castMode 变化（hls.js <-> 原生解码）必须重建播放器
+    const castModeChanged = lastCastModeRef.current !== castMode;
+    lastCastModeRef.current = castMode;
+
     // 非WebKit浏览器且播放器已存在，使用switch方法切换
-    if (!isWebkit && artPlayerRef.current) {
+    if (!isWebkit && artPlayerRef.current && !castModeChanged) {
       artPlayerRef.current.switch = videoUrl;
       artPlayerRef.current.title = `${videoTitle} - 第${
         currentEpisodeIndex + 1
@@ -1212,8 +1426,18 @@ function PlayPageClient() {
 
     // WebKit浏览器或首次创建：销毁之前的播放器实例并创建新的
     if (artPlayerRef.current) {
+      // 重建前记录播放进度，避免切换解码模式后从头开始
+      if (castModeChanged) {
+        const t = artPlayerRef.current.currentTime || 0;
+        if (t > 1) resumeTimeRef.current = t;
+      }
       if (artPlayerRef.current.video && artPlayerRef.current.video.hls) {
         artPlayerRef.current.video.hls.destroy();
+      }
+      // 销毁播放器前解除投屏状态监听
+      if (stopWatchCastRef.current) {
+        stopWatchCastRef.current();
+        stopWatchCastRef.current = null;
       }
       // 销毁播放器实例
       artPlayerRef.current.destroy();
@@ -1256,12 +1480,23 @@ function PlayPageClient() {
         fastForward: true,
         autoOrientation: true,
         lock: true,
-        moreVideoAttr: {
-          crossOrigin: 'anonymous',
-        },
+        // 原生解码（投屏模式）下不能设置 crossOrigin：多数播放源未返回 CORS 头，
+        // 会导致浏览器原生 HLS 加载失败，进而投屏黑屏
+        moreVideoAttr: useNativeHls ? {} : { crossOrigin: 'anonymous' },
         // HLS 支持配置
         customType: {
           m3u8: function (video: HTMLVideoElement, url: string) {
+            // 投屏模式：交给浏览器原生 HLS 解码，video.src 为真实地址，远端设备才可接管
+            if (useNativeHls) {
+              if (video.hls) {
+                video.hls.destroy();
+                video.hls = null;
+              }
+              video.removeAttribute('crossorigin');
+              video.src = url;
+              return;
+            }
+
             if (!Hls) {
               console.error('HLS.js 未加载');
               return;
@@ -1415,6 +1650,20 @@ function PlayPageClient() {
         ],
         // 控制栏配置
         controls: [
+          // 投屏入口：仅当浏览器具备 AirPlay / Remote Playback 能力时出现
+          ...(castCaps.supported
+            ? [
+                {
+                  position: 'right' as const,
+                  index: 45,
+                  html: `<i class="art-icon flex"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 16.1A5 5 0 0 1 5.9 20M2 12.05A9 9 0 0 1 9.95 20M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6"/><line x1="2" y1="20" x2="2.01" y2="20"/></svg></i>`,
+                  tooltip: '投屏',
+                  click: function () {
+                    openCastPanel();
+                  },
+                },
+              ]
+            : []),
           {
             position: 'left',
             index: 13,
@@ -1426,6 +1675,26 @@ function PlayPageClient() {
           },
         ],
       });
+
+      // 准备 video 的投屏属性并监听投屏连接状态
+      const castVideo = artPlayerRef.current?.video as
+        | HTMLVideoElement
+        | undefined;
+      if (castVideo) {
+        prepareVideoForCasting(castVideo);
+        if (stopWatchCastRef.current) stopWatchCastRef.current();
+        stopWatchCastRef.current = watchCastTarget(castVideo, (connected) => {
+          setCastConnected(connected);
+          if (connected) {
+            setCastMessage(null);
+            if (artPlayerRef.current) {
+              artPlayerRef.current.notice.show = '已开始投屏';
+            }
+          } else {
+            setCastMessage('投屏已断开');
+          }
+        });
+      }
 
       // 监听播放器事件
       artPlayerRef.current.on('ready', () => {
@@ -1476,6 +1745,36 @@ function PlayPageClient() {
 
         // 隐藏换源加载状态
         setIsVideoLoading(false);
+
+        // 若存在待执行的投屏动作（刚由 hls.js 切到原生解码），此时再唤起设备选择器
+        if (pendingCastRef.current) {
+          const action = pendingCastRef.current;
+          pendingCastRef.current = null;
+          setTimeout(() => {
+            const video = artPlayerRef.current?.video as
+              | HTMLVideoElement
+              | undefined;
+            if (!video) return;
+            if (action === 'airplay') {
+              const ok = showAirPlayPicker(video);
+              setCastMessage(
+                ok
+                  ? '若设备列表未弹出，请再点一次「AirPlay 投屏」（浏览器要求用户手势触发）'
+                  : '未找到可用的 AirPlay 设备'
+              );
+            } else {
+              setCastBusy(true);
+              promptRemotePlayback(video).then((result) => {
+                setCastBusy(false);
+                setCastMessage(
+                  result.ok
+                    ? '已连接到投屏设备'
+                    : '未连接成功，请重试或复制播放地址到其他设备播放'
+                );
+              });
+            }
+          }, 600);
+        }
       });
 
       // 监听视频时间更新事件，实现跳过片头片尾
@@ -1569,13 +1868,17 @@ function PlayPageClient() {
       console.error('创建播放器失败:', err);
       setError('播放器初始化失败');
     }
-  }, [Artplayer, Hls, videoUrl, loading, blockAdEnabled]);
+  }, [Artplayer, Hls, videoUrl, loading, blockAdEnabled, castMode]);
 
   // 当组件卸载时清理定时器
   useEffect(() => {
     return () => {
       if (saveIntervalRef.current) {
         clearInterval(saveIntervalRef.current);
+      }
+      if (stopWatchCastRef.current) {
+        stopWatchCastRef.current();
+        stopWatchCastRef.current = null;
       }
     };
   }, []);
@@ -1815,6 +2118,32 @@ function PlayPageClient() {
                   ref={artRef}
                   className='bg-black w-full h-full rounded-xl overflow-hidden shadow-lg'
                 ></div>
+
+                {/* 投屏面板 */}
+                {castPanelOpen && (
+                  <CastPanel
+                    url={videoUrl}
+                    connected={castConnected}
+                    castMode={castMode}
+                    busy={castBusy}
+                    message={castMessage}
+                    onClose={() => setCastPanelOpen(false)}
+                    onAirPlay={handleAirPlay}
+                    onRemoteCast={handleRemoteCast}
+                    onEnterCastMode={() => {
+                      // 切换原生解码后按浏览器能力选择默认投屏通道
+                      const caps = detectCastCapabilities();
+                      pendingCastRef.current = caps.airplay
+                        ? 'airplay'
+                        : 'remote';
+                      setCastMessage('正在切换原生解码，稍后自动弹出设备列表…');
+                      enableCastMode();
+                    }}
+                    onExitCastMode={disableCastMode}
+                    onStopCast={handleStopCast}
+                    onCopyUrl={handleCopyCastUrl}
+                  />
+                )}
 
                 {/* 换源加载蒙层 */}
                 {isVideoLoading && (
